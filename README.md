@@ -19,6 +19,10 @@ you can just reuse the arena, otherwise the GC will clean it up.
 This patterns keeps memory usage low and predictable while avoiding the number of small allocations.
 In our case, using the arena pattern reduces CPU usage by 50% and latency by 20% while increasing memory usage by 30%.
 
+## Credits
+
+This library is based on the excellent work by [ortuman/nuke](https://github.com/ortuman/nuke) ⚡. The original implementation provided the foundation for this memory arena library. We've adapted and extended it for our specific use cases while maintaining the core concepts and performance benefits.
+
 ## Arena Lifecycle
 
 The Arena interface provides two methods for managing memory:
