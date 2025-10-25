@@ -59,6 +59,22 @@ func (b *Buffer) WriteString(s string) (n int, err error) {
 	return len(s), nil
 }
 
+func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
+	if b.off == 0 {
+		return 0, nil
+	}
+
+	m, err := w.Write(b.buf[:b.off])
+	if m > 0 {
+		n += int64(m)
+		// Remove written bytes by shifting remaining data
+		copy(b.buf, b.buf[m:b.off])
+		b.off -= m
+	}
+
+	return n, err
+}
+
 // Read reads up to len(p) bytes from the buffer into p.
 // It returns the number of bytes read and any error encountered.
 func (b *Buffer) Read(p []byte) (n int, err error) {
