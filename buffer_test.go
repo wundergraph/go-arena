@@ -13,6 +13,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type shortWriter struct {
+	maxPerWrite int
+	buf         bytes.Buffer
+	err         error
+	writes      int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if len(p) == 0 {
+		return 0, w.err
+	}
+	if w.maxPerWrite > 0 && len(p) > w.maxPerWrite {
+		p = p[:w.maxPerWrite]
+	}
+	n, _ := w.buf.Write(p)
+	return n, w.err
+}
+
 // isMonotonicArenaPtr checks if a pointer is within the memory range of a monotonic arena
 func isMonotonicArenaPtr(arena Arena, ptr unsafe.Pointer) bool {
 	// Cast to monotonicArena to access internal structure
@@ -96,7 +115,7 @@ func TestArenaBufferReadOperations(t *testing.T) {
 	// Test reading remaining data
 	p = make([]byte, 10)
 	n, err = buf.Read(p)
-	require.Equal(t, io.EOF, err)
+	require.NoError(t, err)
 	require.Equal(t, 5, n)
 	require.Equal(t, []byte("world"), p[:n])
 	require.Equal(t, 0, buf.Len())
@@ -258,6 +277,114 @@ func TestArenaBufferIoWriterCompatibility(t *testing.T) {
 	require.Equal(t, "hello", buf.String())
 }
 
+func TestArenaBufferEmptyWritesDoNotChangeState(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+	buf := NewArenaBuffer(arena)
+
+	_, err := buf.Write([]byte("hello"))
+	require.NoError(t, err)
+	originalCap := buf.Cap()
+
+	n, err := buf.Write(nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+	require.Equal(t, "hello", buf.String())
+	require.Equal(t, 5, buf.Len())
+	require.Equal(t, originalCap, buf.Cap())
+
+	n, err = buf.WriteString("")
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+	require.Equal(t, "hello", buf.String())
+	require.Equal(t, 5, buf.Len())
+	require.Equal(t, originalCap, buf.Cap())
+}
+
+func TestArenaBufferWriteToEmptyBuffer(t *testing.T) {
+	buf := NewArenaBuffer(nil)
+	writer := &shortWriter{maxPerWrite: 2}
+
+	n, err := buf.WriteTo(writer)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), n)
+	require.Equal(t, 0, writer.writes)
+}
+
+func TestArenaBufferWriteToReturnsShortWrite(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+	buf := NewArenaBuffer(arena)
+	_, err := buf.WriteString("hello world")
+	require.NoError(t, err)
+
+	writer := &shortWriter{maxPerWrite: 3}
+	n, err := buf.WriteTo(writer)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Equal(t, int64(3), n)
+	require.Equal(t, "hel", writer.buf.String())
+	require.Equal(t, "lo world", buf.String())
+	require.Equal(t, len("lo world"), buf.Len())
+	require.Equal(t, 1, writer.writes)
+}
+
+func TestArenaBufferWriteToPartialWriteWithError(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+	buf := NewArenaBuffer(arena)
+	_, err := buf.WriteString("hello")
+	require.NoError(t, err)
+
+	writer := &shortWriter{maxPerWrite: 2, err: io.ErrClosedPipe}
+	n, err := buf.WriteTo(writer)
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+	require.Equal(t, int64(2), n)
+	require.Equal(t, "he", writer.buf.String())
+	require.Equal(t, "llo", buf.String())
+	require.Equal(t, 3, buf.Len())
+}
+
+func TestArenaBufferWriteAfterReadDoesNotReviveConsumedBytes(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+	buf := NewArenaBuffer(arena)
+
+	_, err := buf.WriteString("abcdef")
+	require.NoError(t, err)
+
+	readBuf := make([]byte, 3)
+	n, err := buf.Read(readBuf)
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	require.Equal(t, "abc", string(readBuf))
+	require.Equal(t, "def", buf.String())
+
+	_, err = buf.WriteString("XYZ")
+	require.NoError(t, err)
+	require.Equal(t, "defXYZ", buf.String())
+	require.Equal(t, 6, buf.Len())
+}
+
+func TestArenaBufferWriteAfterTruncateDoesNotReviveDiscardedBytes(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+	buf := NewArenaBuffer(arena)
+
+	_, err := buf.WriteString("abcdef")
+	require.NoError(t, err)
+
+	buf.Truncate(3)
+	require.Equal(t, "abc", buf.String())
+
+	_, err = buf.WriteString("XYZ")
+	require.NoError(t, err)
+	require.Equal(t, "abcXYZ", buf.String())
+	require.Equal(t, 6, buf.Len())
+}
+
+func TestArenaBufferReadZeroLengthOnEmptyBuffer(t *testing.T) {
+	buf := NewArenaBuffer(nil)
+
+	n, err := buf.Read(nil)
+	require.NoError(t, err)
+	require.Equal(t, 0, n)
+}
+
 func TestArenaBufferLargeWrites(t *testing.T) {
 	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024*1024)) // 1MB arena
 	buf := NewArenaBuffer(arena)
@@ -332,6 +459,10 @@ func TestArenaBufferEmptyOperations(t *testing.T) {
 	// Next from empty buffer
 	result := buf.Next(5)
 	require.Equal(t, []byte{}, result)
+
+	// Next with non-positive values
+	require.Equal(t, []byte{}, buf.Next(0))
+	require.Equal(t, []byte{}, buf.Next(-1))
 }
 
 func TestArenaBufferResetAfterOperations(t *testing.T) {

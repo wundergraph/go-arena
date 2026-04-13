@@ -64,12 +64,17 @@ func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
 		return 0, nil
 	}
 
+	remaining := b.off
 	m, err := w.Write(b.buf[:b.off])
 	if m > 0 {
 		n += int64(m)
 		// Remove written bytes by shifting remaining data
 		copy(b.buf, b.buf[m:b.off])
 		b.off -= m
+		b.buf = b.buf[:b.off]
+	}
+	if err == nil && m != remaining {
+		err = io.ErrShortWrite
 	}
 
 	return n, err
@@ -78,18 +83,18 @@ func (b *Buffer) WriteTo(w io.Writer) (n int64, err error) {
 // Read reads up to len(p) bytes from the buffer into p.
 // It returns the number of bytes read and any error encountered.
 func (b *Buffer) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if b.off == 0 {
 		return 0, io.EOF
 	}
 
 	n = copy(p, b.buf[:b.off])
-	if n < len(p) {
-		err = io.EOF
-	}
-
 	// Remove read bytes by shifting remaining data
 	copy(b.buf, b.buf[n:b.off])
 	b.off -= n
+	b.buf = b.buf[:b.off]
 
 	return n, err
 }
@@ -104,6 +109,7 @@ func (b *Buffer) ReadByte() (byte, error) {
 	c := b.buf[0]
 	copy(b.buf, b.buf[1:b.off])
 	b.off--
+	b.buf = b.buf[:b.off]
 
 	return c, nil
 }
@@ -147,6 +153,7 @@ func (b *Buffer) Truncate(n int) {
 		panic("arena: truncation out of range")
 	}
 	b.off = n
+	b.buf = b.buf[:b.off]
 }
 
 // Next returns a slice containing the next n bytes from the buffer,
@@ -168,6 +175,7 @@ func (b *Buffer) Next(n int) []byte {
 	copy(result, b.buf[:n])
 	copy(b.buf, b.buf[n:b.off])
 	b.off -= n
+	b.buf = b.buf[:b.off]
 
 	return result
 }
@@ -186,10 +194,7 @@ func (b *Buffer) ReadFrom(r io.Reader) (n int64, err error) {
 		nr, er := r.Read(b.readBuf)
 		if nr > 0 {
 			// Write the read data to our buffer
-			_, ew := b.Write(b.readBuf[:nr])
-			if ew != nil {
-				return n, ew
-			}
+			_, _ = b.Write(b.readBuf[:nr])
 			n += int64(nr)
 		}
 		if er != nil {

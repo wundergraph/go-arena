@@ -8,6 +8,7 @@ import (
 
 type monotonicArena struct {
 	buffers            []*monotonicBuffer
+	totalAlloc         uintptr // running sum of s.offset across all buffers; avoids O(buffers) scans on the hot path
 	peak               uintptr // tracks peak allocated space
 	minBufferSize      uintptr // minimum size for new buffers
 	initialBufferCount int     // number of initial buffers to create
@@ -23,50 +24,61 @@ func newMonotonicBuffer(size int) *monotonicBuffer {
 	return &monotonicBuffer{size: uintptr(size)}
 }
 
-func (s *monotonicBuffer) alloc(size, alignment uintptr) (unsafe.Pointer, bool) {
+// alloc reserves size bytes aligned to alignment and returns a pointer to the
+// start of the region along with the total bytes consumed (size + alignment padding).
+// The returned memory is guaranteed to be zeroed: freshly allocated buffers come
+// from make([]byte, size) (zeroed by Go) and reset() zeroes the used prefix of
+// the buffer in a single memclr, so the invariant "bytes at [offset, size) are
+// zero" holds at the start of every alloc.
+func (s *monotonicBuffer) alloc(size, alignment uintptr) (unsafe.Pointer, uintptr, bool) {
 	if s.ptr == nil {
+		if s.size > uintptr(maxInt) {
+			return nil, 0, false
+		}
 		buf := make([]byte, s.size) // allocate monotonic buffer lazily
 		s.ptr = unsafe.Pointer(unsafe.SliceData(buf))
 	}
-	alignOffset := uintptr(0)
-	for alignedPtr := uintptr(s.ptr) + s.offset; alignedPtr%alignment != 0; alignedPtr++ {
-		alignOffset++
+	// O(1) alignment: round offset up to the next multiple of alignment.
+	// Works for any positive alignment (power-of-2 or not).
+	offset := s.offset
+	if alignment > 1 {
+		if rem := (uintptr(s.ptr) + offset) % alignment; rem != 0 {
+			offset += alignment - rem
+		}
 	}
-	allocSize := size + alignOffset
+	allocSize := (offset - s.offset) + size
+	// Overflow guard: if size is close to MaxUintptr, the addition above
+	// can wrap and produce a tiny allocSize, bypassing the bounds check.
+	if allocSize < size {
+		return nil, 0, false
+	}
 
-	if s.availableBytes() < allocSize {
-		return nil, false
+	if s.size-s.offset < allocSize {
+		return nil, 0, false
 	}
-	ptr := unsafe.Pointer(uintptr(s.ptr) + s.offset + alignOffset)
+	ptr := unsafe.Pointer(uintptr(s.ptr) + offset)
 	s.offset += allocSize
-
-	// This piece of code will be translated into a runtime.memclrNoHeapPointers
-	// invocation by the compiler, which is an assembler optimized implementation.
-	// Architecture specific code can be found at src/runtime/memclr_$GOARCH.s
-	// in Go source (since https://codereview.appspot.com/137880043).
-	b := unsafe.Slice((*byte)(ptr), size)
-
-	for i := range b {
-		b[i] = 0
-	}
-
-	return ptr, true
+	// No per-alloc zeroing: the invariant is maintained by make() on lazy
+	// buffer creation and by reset() doing a single bulk memclr.
+	return ptr, allocSize, true
 }
 
 func (s *monotonicBuffer) reset() {
 	if s.offset == 0 {
 		return
 	}
+	// Zero the used prefix in one call so that the "bytes at [offset, size)
+	// are zero" invariant holds for subsequent allocs without per-alloc
+	// zeroing. This is the same total work as zeroing on every alloc, but
+	// runtime.memclrNoHeapPointers is dramatically faster on large
+	// contiguous ranges than on millions of tiny ones.
+	clear(unsafe.Slice((*byte)(s.ptr), s.offset))
 	s.offset = 0
 }
 
 func (s *monotonicBuffer) release() {
 	s.offset = 0
 	s.ptr = nil
-}
-
-func (s *monotonicBuffer) availableBytes() uintptr {
-	return s.size - s.offset
 }
 
 // NewMonotonicArena creates a new monotonic arena with optional configuration.
@@ -92,6 +104,7 @@ func NewMonotonicArena(opts ...MonotonicArenaOption) Arena {
 
 const (
 	minBufferSize = 1024 * 32 // 32KB
+	maxInt        = int(^uint(0) >> 1)
 )
 
 // MonotonicArenaOption represents a configuration option for a monotonic arena.
@@ -113,50 +126,58 @@ func WithInitialBufferCount(count int) MonotonicArenaOption {
 
 // Alloc satisfies the Arena interface.
 func (a *monotonicArena) Alloc(size, alignment uintptr) unsafe.Pointer {
+	// Zero-size allocations are a no-op. Returning nil tells the caller
+	// (e.g. AllocateSlice, Allocate[T]) to fall back to the heap (make/new),
+	// which keeps checkptr happy. For zero-sized types this means T is heap-
+	// backed instead of arena-backed, but since the allocation holds no
+	// memory, the lifetime difference is not observable.
+	if size == 0 {
+		return nil
+	}
 	for i := 0; i < len(a.buffers); i++ {
-		ptr, ok := a.buffers[i].alloc(size, alignment)
+		ptr, consumed, ok := a.buffers[i].alloc(size, alignment)
 		if ok {
-			// Update peak if current allocation exceeds it
-			currentLen := a.len()
-			if currentLen > a.peak {
-				a.peak = currentLen
+			a.totalAlloc += consumed
+			if a.totalAlloc > a.peak {
+				a.peak = a.totalAlloc
 			}
 			return ptr
 		}
 	}
 
-	// No existing buffer has enough space, create a new one
-	// Calculate the required size including alignment
-	currentLen := a.len()
-	alignOffset := uintptr(0)
-	if currentLen > 0 {
-		for alignedPtr := currentLen; alignedPtr%alignment != 0; alignedPtr++ {
-			alignOffset++
+	// No existing buffer has enough space, create a new one. Reserve
+	// (alignment - 1) bytes of margin so the first allocation on the
+	// new buffer can always satisfy arbitrary alignment, even when the
+	// backing []byte's base pointer is not aligned to `alignment`.
+	// make([]byte, n) returns at least 8-byte-aligned memory on 64-bit
+	// Go, so for alignment ≤ 8 the margin is wasted — but for callers
+	// that pass alignment > 8 (e.g., 16 for SIMD-friendly structs)
+	// this is what keeps the subsequent alloc from returning nil.
+	newBufferSize := size
+	if alignment > 1 {
+		newBufferSize += alignment - 1
+		// Overflow guard: if the caller passed a size near MaxUintptr,
+		// adding the alignment margin wraps and we'd allocate a tiny
+		// buffer that appears to satisfy a huge request.
+		if newBufferSize < size {
+			return nil
 		}
 	}
-	requiredSize := size + alignOffset
-
-	// New buffer should be at least minBuffer, but large enough for the allocation
-	newBufferSize := requiredSize
 	if newBufferSize < a.minBufferSize {
 		newBufferSize = a.minBufferSize
 	}
+	if newBufferSize > uintptr(maxInt) {
+		return nil
+	}
 
-	// Create and add the new buffer
 	newBuffer := newMonotonicBuffer(int(newBufferSize))
 	a.buffers = append(a.buffers, newBuffer)
 
-	// Allocate on the new buffer
-	ptr, ok := newBuffer.alloc(size, alignment)
-	if !ok {
-		// This should never happen since we just created a buffer large enough
-		panic("failed to allocate on newly created buffer")
-	}
+	ptr, consumed, _ := newBuffer.alloc(size, alignment)
 
-	// Update peak to account for the new buffer and allocation
-	currentLen = a.len()
-	if currentLen > a.peak {
-		a.peak = currentLen
+	a.totalAlloc += consumed
+	if a.totalAlloc > a.peak {
+		a.peak = a.totalAlloc
 	}
 
 	return ptr
@@ -167,6 +188,7 @@ func (a *monotonicArena) Reset() {
 	for _, s := range a.buffers {
 		s.reset()
 	}
+	a.totalAlloc = 0
 }
 
 // Release satisfies the Arena interface.
@@ -174,20 +196,12 @@ func (a *monotonicArena) Release() {
 	for _, s := range a.buffers {
 		s.release()
 	}
-}
-
-// len returns the total number of bytes currently allocated in the arena (internal helper).
-func (a *monotonicArena) len() uintptr {
-	var total uintptr
-	for _, s := range a.buffers {
-		total += s.offset
-	}
-	return total
+	a.totalAlloc = 0
 }
 
 // Len returns the total number of bytes currently allocated in the arena.
 func (a *monotonicArena) Len() int {
-	return int(a.len())
+	return int(a.totalAlloc)
 }
 
 // Cap returns the total capacity (maximum bytes) that can be allocated in the arena.
