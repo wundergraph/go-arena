@@ -171,6 +171,7 @@ func TestConcurrentArenaWrappingNil(t *testing.T) {
 	require.Equal(t, 0, cap)
 
 	// Reset should not panic
+	arena.Reset()
 	arena.Release()
 }
 

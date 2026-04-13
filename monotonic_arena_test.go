@@ -116,6 +116,139 @@ func TestMonotonicArenaAlignment(t *testing.T) {
 	require.NotNil(t, ptr3)
 	len3 := arena.Len()
 	require.True(t, len3 > len2) // Should be more due to alignment padding
+
+	// Force a fresh buffer and verify the first allocation on that buffer still
+	// satisfies a larger alignment. This exercises the new-buffer alignment
+	// margin logic rather than only the in-buffer alignment math above.
+	alignedArena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(32))
+	ptr4 := alignedArena.Alloc(32, 1) // fill the initial buffer exactly
+	require.NotNil(t, ptr4)
+	require.Equal(t, 32, alignedArena.Len())
+
+	ptr5 := alignedArena.Alloc(8, 64)
+	require.NotNil(t, ptr5)
+	require.Zero(t, uintptr(ptr5)%64, "pointer not aligned to 64 bytes on new buffer")
+	require.Equal(t, 2, len(alignedArena.(*monotonicArena).buffers))
+}
+
+// TestMonotonicArenaZeroAfterReset verifies the load-bearing invariant that
+// bytes returned by Alloc are always zero: after writing non-zero data into
+// an allocation, Reset must zero the used prefix so a subsequent Alloc sees
+// zeroed memory. The new design relies on this being maintained by reset()
+// (bulk memclr) rather than by per-alloc zeroing.
+func TestMonotonicArenaZeroAfterReset(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024))
+
+	const size = 256
+	ptr1 := arena.Alloc(size, 1)
+	require.NotNil(t, ptr1)
+
+	// Fill every byte with 0xFF.
+	region := unsafe.Slice((*byte)(ptr1), size)
+	for i := range region {
+		region[i] = 0xFF
+	}
+
+	arena.Reset()
+
+	// Re-allocate the same region; it must come back zeroed.
+	ptr2 := arena.Alloc(size, 1)
+	require.NotNil(t, ptr2)
+	require.Equal(t, ptr1, ptr2, "expected same pointer after reset+realloc")
+	region2 := unsafe.Slice((*byte)(ptr2), size)
+	for i, b := range region2 {
+		require.Equalf(t, byte(0), b, "byte %d not zeroed after reset", i)
+	}
+}
+
+func TestMonotonicArenaZeroSizeAllocations(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64))
+	require.Equal(t, 0, arena.Len())
+
+	ptr := arena.Alloc(0, 1)
+	require.Nil(t, ptr)
+	require.Equal(t, 0, arena.Len())
+
+	value := Allocate[struct{}](arena)
+	require.NotNil(t, value)
+	require.Equal(t, struct{}{}, *value)
+	require.Equal(t, 0, arena.Len())
+
+	slice := AllocateSlice[struct{}](arena, 2, 4)
+	require.Len(t, slice, 2)
+	require.Equal(t, 4, cap(slice))
+	require.Equal(t, []struct{}{{}, {}}, slice)
+	require.Equal(t, 0, arena.Len())
+}
+
+func TestMonotonicBufferAllocFailureLeavesOffsetUnchanged(t *testing.T) {
+	buf := newMonotonicBuffer(8)
+
+	ptr, consumed, ok := buf.alloc(8, 1)
+	require.True(t, ok)
+	require.NotNil(t, ptr)
+	require.Equal(t, uintptr(8), consumed)
+	require.Equal(t, uintptr(8), buf.offset)
+
+	ptr, consumed, ok = buf.alloc(1, 1)
+	require.False(t, ok)
+	require.Nil(t, ptr)
+	require.Zero(t, consumed)
+	require.Equal(t, uintptr(8), buf.offset)
+}
+
+func TestMonotonicBufferAllocOverflowGuard(t *testing.T) {
+	backing := [8]byte{}
+	buf := &monotonicBuffer{
+		ptr:    unsafe.Pointer(&backing[0]),
+		offset: 1,
+		size:   8,
+	}
+
+	ptr, consumed, ok := buf.alloc(^uintptr(0), 2)
+	require.False(t, ok)
+	require.Nil(t, ptr)
+	require.Zero(t, consumed)
+	require.Equal(t, uintptr(1), buf.offset)
+}
+
+func TestMonotonicBufferAllocRejectsBufferSizeAboveMaxInt(t *testing.T) {
+	buf := &monotonicBuffer{
+		size: uintptr(maxInt) + 1,
+	}
+
+	ptr, consumed, ok := buf.alloc(1, 1)
+	require.False(t, ok)
+	require.Nil(t, ptr)
+	require.Zero(t, consumed)
+	require.Nil(t, buf.ptr)
+	require.Zero(t, buf.offset)
+}
+
+func TestMonotonicArenaAllocOverflowGuard(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(64))
+	require.Equal(t, 0, arena.Cap())
+	require.Equal(t, 0, arena.Len())
+	require.Equal(t, 0, arena.Peak())
+
+	ptr := arena.Alloc(^uintptr(0), 2)
+	require.Nil(t, ptr)
+	require.Equal(t, 0, arena.Cap())
+	require.Equal(t, 0, arena.Len())
+	require.Equal(t, 0, arena.Peak())
+}
+
+func TestMonotonicArenaAllocRejectsSizeAboveMaxInt(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(64))
+	tooLarge := uintptr(int(^uint(0)>>1)) + 1
+
+	require.NotPanics(t, func() {
+		ptr := arena.Alloc(tooLarge, 1)
+		require.Nil(t, ptr)
+	})
+	require.Equal(t, 0, arena.Cap())
+	require.Equal(t, 0, arena.Len())
+	require.Equal(t, 0, arena.Peak())
 }
 
 func TestMonotonicArenaWithTypes(t *testing.T) {
@@ -174,6 +307,38 @@ func BenchmarkMonotonicArenaLen(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = arena.Len()
+	}
+}
+
+// BenchmarkMonotonicArenaAlloc measures the hot alloc path: O(1) alignment
+// math, no per-alloc zeroing. The arena is sized large enough that a single
+// buffer holds every iteration, so we're timing alloc itself rather than
+// buffer growth.
+func BenchmarkMonotonicArenaAlloc(b *testing.B) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(256*1024*1024))
+	b.ResetTimer()
+	for b.Loop() {
+		if arena.Len() > 200*1024*1024 {
+			b.StopTimer()
+			arena.Reset()
+			b.StartTimer()
+		}
+		_ = arena.Alloc(64, 8)
+	}
+}
+
+// BenchmarkMonotonicArenaAllocAligned64 stresses the alignment-margin path
+// with a cache-line-sized alignment request.
+func BenchmarkMonotonicArenaAllocAligned64(b *testing.B) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(256*1024*1024))
+	b.ResetTimer()
+	for b.Loop() {
+		if arena.Len() > 200*1024*1024 {
+			b.StopTimer()
+			arena.Reset()
+			b.StartTimer()
+		}
+		_ = arena.Alloc(64, 64)
 	}
 }
 
