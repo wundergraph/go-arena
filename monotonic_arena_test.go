@@ -3,6 +3,7 @@
 package arena
 
 import (
+	"fmt"
 	"testing"
 	"unsafe"
 
@@ -873,6 +874,181 @@ func TestMonotonicArenaInitialBufferCountAllocation(t *testing.T) {
 	require.Equal(t, 200, arena.Len())
 	// The third buffer might have enough space, or we might need a fourth buffer
 	require.True(t, len(arena.(*monotonicArena).buffers) >= 3)
+}
+
+// TestMonotonicArenaCursorStartsAtZero verifies the cursor is zero on a fresh
+// arena, before any Alloc has succeeded.
+func TestMonotonicArenaCursorStartsAtZero(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorStaysOnSameBufferHit verifies that successive allocs
+// landing in the same buffer leave the cursor unchanged.
+func TestMonotonicArenaCursorStaysOnSameBufferHit(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorAdvancesOnGrow verifies that growing the arena (when
+// no existing buffer can fit the request) advances the cursor to the new
+// trailing buffer.
+func TestMonotonicArenaCursorAdvancesOnGrow(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.Equal(t, 1, len(arena.buffers))
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 1, arena.cursor)
+	require.Equal(t, 2, len(arena.buffers))
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 2, arena.cursor)
+	require.Equal(t, 3, len(arena.buffers))
+}
+
+// TestMonotonicArenaCursorAdvancesPastFullBuffersToLaterBuffer verifies that
+// when the cursor's buffer is full but a later existing buffer has space, the
+// cursor advances to the later buffer that satisfied the alloc.
+func TestMonotonicArenaCursorAdvancesPastFullBuffersToLaterBuffer(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(3), WithMinBufferSize(64)).(*monotonicArena)
+	require.Equal(t, 3, len(arena.buffers))
+
+	arena.buffers[0].alloc(64, 1)
+	arena.buffers[1].alloc(64, 1)
+	require.Equal(t, 0, arena.cursor)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 2, arena.cursor)
+	require.Equal(t, 3, len(arena.buffers))
+}
+
+// TestMonotonicArenaCursorRewindsOnReset verifies that Reset returns the
+// cursor to zero so subsequent allocs can reuse early buffers.
+func TestMonotonicArenaCursorRewindsOnReset(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 2, arena.cursor)
+
+	arena.Reset()
+	require.Equal(t, 0, arena.cursor)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorRewindsOnRelease verifies that Release returns the
+// cursor to zero so the arena starts fresh after release.
+func TestMonotonicArenaCursorRewindsOnRelease(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 1, arena.cursor)
+
+	arena.Release()
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorDoesNotRescanFullBuffers verifies the regression
+// bound: after the arena has grown, the cursor pins subsequent allocs to the
+// trailing buffer instead of rescanning full buffers from index 0. This is
+// the optimization that closes issue #2.
+func TestMonotonicArenaCursorDoesNotRescanFullBuffers(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	for range 10 {
+		require.NotNil(t, arena.Alloc(64, 1))
+	}
+	require.Equal(t, 10, len(arena.buffers))
+	require.Equal(t, 9, arena.cursor)
+
+	// First small alloc forces a grow (buffer[9] is full from the 10th
+	// exact-fill alloc above). The new trailing buffer becomes the cursor.
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 11, len(arena.buffers))
+	require.Equal(t, 10, arena.cursor)
+
+	// All subsequent small allocs land in buffer[10] without rescanning the
+	// 10 full buffers in front of it. The cursor stays put until that
+	// buffer fills.
+	for range 7 {
+		require.NotNil(t, arena.Alloc(8, 1))
+		require.Equal(t, 10, arena.cursor)
+		require.Equal(t, 11, len(arena.buffers))
+	}
+}
+
+// BenchmarkMonotonicArenaAllocAfterFullBuffers reproduces the Cosmo Router
+// hot path from issue #2: an arena with many full buffers, where every Alloc
+// walks past them to find space in the trailing buffer. The unpatched code
+// walks a.buffers from index 0 on every call, giving O(numBuffers) cost
+// per alloc and O(N²) total work over the lifetime of an arena that grows to
+// N buffers. The cursor optimization makes each alloc O(1) regardless of the
+// prefix length.
+//
+// Setup: pre-fill numBuffers buffers exactly to capacity, then manually
+// append a single large trailing buffer. The timed loop recycles only the
+// trailing buffer's offset on overflow, so the total buffer count stays fixed
+// at numBuffers+1 and the prefix-walk cost dominates the measurement instead
+// of being diluted by buffer-count drift.
+func BenchmarkMonotonicArenaAllocAfterFullBuffers(b *testing.B) {
+	const bufSize = 1024
+	const allocSize = 8
+	const trailingSize = 8 * 1024 * 1024
+	for _, numBuffers := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("prefix=%d", numBuffers), func(b *testing.B) {
+			arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize)).(*monotonicArena)
+			for range numBuffers {
+				_ = arena.Alloc(bufSize, 1)
+			}
+			arena.buffers = append(arena.buffers, newMonotonicBuffer(trailingSize))
+			_ = arena.Alloc(allocSize, 1)
+			trailing := arena.buffers[len(arena.buffers)-1]
+			b.ResetTimer()
+			for b.Loop() {
+				if trailing.offset+allocSize > trailing.size {
+					b.StopTimer()
+					trailing.offset = 0
+					b.StartTimer()
+				}
+				_ = arena.Alloc(allocSize, 1)
+			}
+		})
+	}
+}
+
+// BenchmarkMonotonicArenaAllocCosmoLike approximates the Cosmo Router workload
+// described in issue #2: an arena that grows naturally during use, with many
+// small allocations after the arena has already grown to many buffers. The
+// arena grows during the timed loop (no manual offset tricks), so this is the
+// closest representation of the real-world cost a caller pays.
+func BenchmarkMonotonicArenaAllocCosmoLike(b *testing.B) {
+	const bufSize = 1024
+	const allocSize = 8
+	for _, numBuffers := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("prefix=%d", numBuffers), func(b *testing.B) {
+			arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize))
+			for range numBuffers {
+				_ = arena.Alloc(bufSize, 1)
+			}
+			b.ResetTimer()
+			for b.Loop() {
+				_ = arena.Alloc(allocSize, 1)
+			}
+		})
+	}
 }
 
 func TestMonotonicArenaInitialBufferCountReset(t *testing.T) {

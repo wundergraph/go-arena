@@ -12,6 +12,15 @@ type monotonicArena struct {
 	peak               uintptr // tracks peak allocated space
 	minBufferSize      uintptr // minimum size for new buffers
 	initialBufferCount int     // number of initial buffers to create
+	// cursor is the index of the buffer where the most recent Alloc found
+	// space. Subsequent Allocs start their walk at cursor instead of index 0,
+	// skipping buffers that earlier Allocs have already exhausted. The cursor
+	// only advances; once past, a buffer's remaining free space is no longer
+	// searched for the rest of the request. Reset and Release rewind cursor
+	// to 0 so a reused arena can re-fill its early buffers from scratch. For
+	// allocations of roughly uniform size that still fit at cursor, this
+	// reduces per-Alloc cost from O(len(buffers)) to O(1).
+	cursor int
 }
 
 type monotonicBuffer struct {
@@ -134,9 +143,10 @@ func (a *monotonicArena) Alloc(size, alignment uintptr) unsafe.Pointer {
 	if size == 0 {
 		return nil
 	}
-	for i := 0; i < len(a.buffers); i++ {
+	for i := a.cursor; i < len(a.buffers); i++ {
 		ptr, consumed, ok := a.buffers[i].alloc(size, alignment)
 		if ok {
+			a.cursor = i
 			a.totalAlloc += consumed
 			if a.totalAlloc > a.peak {
 				a.peak = a.totalAlloc
@@ -172,6 +182,7 @@ func (a *monotonicArena) Alloc(size, alignment uintptr) unsafe.Pointer {
 
 	newBuffer := newMonotonicBuffer(int(newBufferSize))
 	a.buffers = append(a.buffers, newBuffer)
+	a.cursor = len(a.buffers) - 1
 
 	ptr, consumed, _ := newBuffer.alloc(size, alignment)
 
@@ -189,6 +200,7 @@ func (a *monotonicArena) Reset() {
 		s.reset()
 	}
 	a.totalAlloc = 0
+	a.cursor = 0
 }
 
 // Release satisfies the Arena interface.
@@ -197,6 +209,7 @@ func (a *monotonicArena) Release() {
 		s.release()
 	}
 	a.totalAlloc = 0
+	a.cursor = 0
 }
 
 // Len returns the total number of bytes currently allocated in the arena.
