@@ -1120,15 +1120,15 @@ func TestMonotonicArenaCursorBimodalWaste(t *testing.T) {
 		numAlloc = 100000
 	)
 
-	// 6.25% of allocations are large (1–4 buffers wide); the rest are tiny.
-	// The tiny allocations are what get stranded each time a large one moves the cursor.
+	// 6.25% of allocations are large (1–2 buffers wide); the rest are tiny.
+	// Each time a large allocation moves the cursor, we strand the tiny allocations.
 	rng := rand.New(rand.NewPCG(11, 77))
 	sizes := make([]uintptr, numAlloc)
 	for i := range sizes {
 		if i%16 == 0 {
-			sizes[i] = uintptr(bufSize + rng.IntN(2*bufSize)) // 4KB..16KB
+			sizes[i] = uintptr(bufSize + rng.IntN(2*bufSize))
 		} else {
-			sizes[i] = uintptr(8 + rng.IntN(56)) // 8B..64B
+			sizes[i] = uintptr(8 + rng.IntN(56))
 		}
 	}
 
