@@ -4,6 +4,7 @@ package arena
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"testing"
 	"unsafe"
 
@@ -961,10 +962,9 @@ func TestMonotonicArenaCursorRewindsOnRelease(t *testing.T) {
 	require.Equal(t, 0, arena.cursor)
 }
 
-// TestMonotonicArenaCursorDoesNotRescanFullBuffers verifies the regression
-// bound: after the arena has grown, the cursor pins subsequent allocs to the
-// trailing buffer instead of rescanning full buffers from index 0. This is
-// the optimization that closes issue #2.
+// TestMonotonicArenaCursorDoesNotRescanFullBuffers verifies the regression bound:
+// after the arena has grown, the cursor pins subsequent allocs to the
+// trailing buffer instead of rescanning full buffers from index 0.
 func TestMonotonicArenaCursorDoesNotRescanFullBuffers(t *testing.T) {
 	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
 
@@ -990,25 +990,21 @@ func TestMonotonicArenaCursorDoesNotRescanFullBuffers(t *testing.T) {
 	}
 }
 
-// BenchmarkMonotonicArenaAllocAfterFullBuffers reproduces the Cosmo Router
-// hot path from issue #2: an arena with many full buffers, where every Alloc
-// walks past them to find space in the trailing buffer. The unpatched code
-// walks a.buffers from index 0 on every call, giving O(numBuffers) cost
-// per alloc and O(N²) total work over the lifetime of an arena that grows to
-// N buffers. The cursor optimization makes each alloc O(1) regardless of the
-// prefix length.
+// BenchmarkMonotonicArenaAllocAfterFullBuffers measures per-Alloc cost when the
+// arena already holds numBuffers full buffers followed by one buffer with free
+// space — the Cosmo Router hot path from issue #2. A scan from index 0 pays
+// O(numBuffers) per call, so ns/op rises with numBuffers; the cursor
+// optimization starts the scan at the last-used buffer, making it O(1) (flat).
 //
-// Setup: pre-fill numBuffers buffers exactly to capacity, then manually
-// append a single large trailing buffer. The timed loop recycles only the
-// trailing buffer's offset on overflow, so the total buffer count stays fixed
-// at numBuffers+1 and the prefix-walk cost dominates the measurement instead
-// of being diluted by buffer-count drift.
+// The trailing buffer is large and its offset is reset on overflow rather than
+// letting Alloc append new buffers, so the buffer count stays fixed at
+// numBuffers+1 and only the prefix-scan length varies across sub-benchmarks.
 func BenchmarkMonotonicArenaAllocAfterFullBuffers(b *testing.B) {
 	const bufSize = 1024
 	const allocSize = 8
 	const trailingSize = 8 * 1024 * 1024
 	for _, numBuffers := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("prefix=%d", numBuffers), func(b *testing.B) {
+		b.Run(fmt.Sprintf("buffers=%d", numBuffers), func(b *testing.B) {
 			arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize)).(*monotonicArena)
 			for range numBuffers {
 				_ = arena.Alloc(bufSize, 1)
@@ -1029,26 +1025,118 @@ func BenchmarkMonotonicArenaAllocAfterFullBuffers(b *testing.B) {
 	}
 }
 
-// BenchmarkMonotonicArenaAllocCosmoLike approximates the Cosmo Router workload
-// described in issue #2: an arena that grows naturally during use, with many
-// small allocations after the arena has already grown to many buffers. The
-// arena grows during the timed loop (no manual offset tricks), so this is the
-// closest representation of the real-world cost a caller pays.
-func BenchmarkMonotonicArenaAllocCosmoLike(b *testing.B) {
+// BenchmarkMonotonicArenaAllocAcrossBuffers pre-fills N full buffers,
+// then times per-allocation cost while varying allocSize and buffer count.
+// It's measuring allocation cost as the number of existing (full) buffers grows.
+func BenchmarkMonotonicArenaAllocAcrossBuffers(b *testing.B) {
 	const bufSize = 1024
-	const allocSize = 8
-	for _, numBuffers := range []int{10, 100, 1000} {
-		b.Run(fmt.Sprintf("prefix=%d", numBuffers), func(b *testing.B) {
-			arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize))
-			for range numBuffers {
-				_ = arena.Alloc(bufSize, 1)
-			}
-			b.ResetTimer()
-			for b.Loop() {
-				_ = arena.Alloc(allocSize, 1)
-			}
-		})
+	const alignment = 1
+	// allocSize values are deliberately NOT divisors of bufSize so that each
+	// buffer ends with un-fillable tail slack — that slack is the "waste" we
+	// want to measure. (Sizes that divide bufSize evenly produce ~zero waste.)
+	for _, allocSize := range []uintptr{9, 63} {
+		for _, numBuffers := range []int{10, 100, 1000} {
+			b.Run(fmt.Sprintf("allocSize=%d/buffers=%d/", allocSize, numBuffers), func(b *testing.B) {
+				arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize))
+				// Warm up: fully fill numBuffers buffers so the timed loop pays
+				// the full linear scan over all of them before spilling into a
+				// freshly created buffer — the worst-case Cosmo-like path.
+				for range numBuffers {
+					_ = arena.Alloc(bufSize, alignment)
+				}
+
+				// Baseline AFTER warm-up: the warm-up buffers must not count
+				// toward what the timed loop consumes/wastes, so measure deltas
+				// from here.
+				ma := arena.(*monotonicArena)
+				baseCap := ma.Cap()
+				baseLen := ma.Len()
+
+				b.SetBytes(int64(allocSize))
+				b.ResetTimer()
+				for b.Loop() {
+					_ = arena.Alloc(allocSize, alignment)
+				}
+				b.StopTimer()
+
+				consumed := ma.Cap() - baseCap // backing memory created by the loop
+				used := ma.Len() - baseLen     // bytes handed out (incl. padding)
+				slack := consumed - used       // reserved-but-unused buffer space
+
+				// Ratios are N-independent, so they're the comparable numbers.
+				b.ReportMetric(float64(slack)/float64(consumed)*100, "slack%")
+				b.ReportMetric(float64(consumed)/float64(b.N), "consumed-B/op")
+				b.ReportMetric(float64(slack)/float64(b.N), "wasted-B/op")
+
+				arena.Release()
+			})
+		}
 	}
+}
+
+// TestMonotonicArenaCursorMixedSizeWaste documents and regression-guards the
+// memory cost of the cursor scan strategy versus a from-zero first-fit scan
+// under a mixed-size workload.
+//
+// This is a measurement, not a micro-benchmark: the footprint is a property of
+// the whole arena lifecycle and is fully deterministic, so a single replay per
+// strategy yields exact numbers. We assert the qualitative invariant (the
+// cursor trades memory for scan speed, so it must waste at least as much) and
+// log the exact figures.
+func TestMonotonicArenaCursorMixedSizeWaste(t *testing.T) {
+	const (
+		bufSize  = 4096
+		numAlloc = 100000
+	)
+
+	// Fixed-seed, mixed workload: sizes in [8, 512). Deterministic.
+	rng := rand.New(rand.NewPCG(42, 1024))
+	sizes := make([]uintptr, numAlloc)
+	for i := range sizes {
+		sizes[i] = uintptr(8 + rng.IntN(504))
+	}
+
+	// replay runs the fixed workload once and returns the arena's footprint.
+	// When fromZero is set, the cursor is reset before every Alloc, exactly
+	// reproducing the pre-cursor first-fit scan.
+	replay := func(fromZero bool) (consumed, wasted int) {
+		arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(bufSize))
+		defer arena.Release()
+		ma := arena.(*monotonicArena)
+		for _, sz := range sizes {
+			if fromZero {
+				ma.cursor = 0
+			}
+			_ = arena.Alloc(sz, 1)
+		}
+		return ma.Cap(), ma.Cap() - ma.Len()
+	}
+
+	cursorConsumed, cursorWasted := replay(false)
+	scan0Consumed, scan0Wasted := replay(true)
+
+	slackPct := func(wasted, consumed int) float64 {
+		return float64(wasted) / float64(consumed) * 100
+	}
+
+	slackCursorPct := slackPct(cursorWasted, cursorConsumed)
+	slackScanPct := slackPct(scan0Wasted, scan0Consumed)
+	t.Logf("cursor: consumed=%d B  wasted=%d B  slack=%.2f%%",
+		cursorConsumed, cursorWasted, slackCursorPct)
+	t.Logf("scan0 : consumed=%d B  wasted=%d B  slack=%.2f%%",
+		scan0Consumed, scan0Wasted, slackScanPct)
+	t.Logf("cursor consumes %d B (%.1f%%) more memory than first-fit",
+		cursorConsumed-scan0Consumed,
+		float64(cursorConsumed-scan0Consumed)/float64(scan0Consumed)*100)
+
+	// The cursor never backfills earlier buffers.
+	require.GreaterOrEqual(t, cursorWasted, scan0Wasted,
+		"cursor scan should waste >= first-fit scan under mixed sizes")
+	require.GreaterOrEqual(t, cursorConsumed, scan0Consumed,
+		"cursor should consume >= first-fit (it abandons reusable slack)")
+
+	require.Less(t, slackCursorPct, 5.0)
+	require.Less(t, slackScanPct, 1.0)
 }
 
 func TestMonotonicArenaInitialBufferCountReset(t *testing.T) {
