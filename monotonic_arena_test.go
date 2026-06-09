@@ -1096,47 +1096,83 @@ func TestMonotonicArenaCursorMixedSizeWaste(t *testing.T) {
 		sizes[i] = uintptr(8 + rng.IntN(504))
 	}
 
-	// replay runs the fixed workload once and returns the arena's footprint.
-	// When fromZero is set, the cursor is reset before every Alloc, exactly
-	// reproducing the pre-cursor first-fit scan.
-	replay := func(fromZero bool) (consumed, wasted int) {
-		arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(bufSize))
-		defer arena.Release()
-		ma := arena.(*monotonicArena)
-		for _, sz := range sizes {
-			if fromZero {
-				ma.cursor = 0
-			}
-			_ = arena.Alloc(sz, 1)
+	cursorConsumed, cursorWasted := replayWaste(sizes, bufSize, false)
+	scan0Consumed, scan0Wasted := replayWaste(sizes, bufSize, true)
+
+	cursorSlackPct, scanSlackPct := testLogWasteComparison(t, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted)
+
+	// The cursor never backfills earlier buffers.
+	require.Greater(t, cursorWasted, scan0Wasted,
+		"cursor scan should waste > first-fit scan under mixed sizes")
+	require.Greater(t, cursorConsumed, scan0Consumed,
+		"cursor should consume > first-fit")
+
+	// observed ~4.16% vs ~0.06% slack
+	require.Less(t, cursorSlackPct, 5.0)
+	require.Less(t, scanSlackPct, 1.0)
+}
+
+// TestMonotonicArenaCursorBimodalWaste tests the cursor's worst case: a
+// bimodal workload of mostly tiny allocations with occasional multi-KB ones.
+func TestMonotonicArenaCursorBimodalWaste(t *testing.T) {
+	const (
+		bufSize  = 4096
+		numAlloc = 100000
+	)
+
+	// 6.25% of allocations are large (1–4 buffers wide); the rest are tiny.
+	// The tiny allocations are what get stranded each time a large one moves the cursor.
+	rng := rand.New(rand.NewPCG(11, 77))
+	sizes := make([]uintptr, numAlloc)
+	for i := range sizes {
+		if i%16 == 0 {
+			sizes[i] = uintptr(bufSize + rng.IntN(2*bufSize)) // 4KB..16KB
+		} else {
+			sizes[i] = uintptr(8 + rng.IntN(56)) // 8B..64B
 		}
-		return ma.Cap(), ma.Cap() - ma.Len()
 	}
 
-	cursorConsumed, cursorWasted := replay(false)
-	scan0Consumed, scan0Wasted := replay(true)
+	cursorConsumed, cursorWasted := replayWaste(sizes, bufSize, false)
+	scan0Consumed, scan0Wasted := replayWaste(sizes, bufSize, true)
 
-	slackPct := func(wasted, consumed int) float64 {
-		return float64(wasted) / float64(consumed) * 100
+	cursorSlackPct, scanSlackPct := testLogWasteComparison(t, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted)
+
+	require.Greater(t, cursorWasted, scan0Wasted,
+		"bimodal workload should make the cursor waste strictly more than first-fit")
+	require.Greater(t, cursorConsumed, scan0Consumed,
+		"cursor should consume > first-fit")
+	// observed ~29.2% vs <0.01% slack
+	require.Less(t, cursorSlackPct, 30.0)
+	require.Less(t, scanSlackPct, 1.0)
+}
+
+// replayWaste runs a fixed allocation-size sequence through a fresh arena and
+// returns its footprint (total backing memory, and reserved-but-unused slack).
+func replayWaste(sizes []uintptr, bufSize int, fromZero bool) (consumed, wasted int) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(bufSize))
+	defer arena.Release()
+	ma := arena.(*monotonicArena)
+	for _, sz := range sizes {
+		if fromZero {
+			ma.cursor = 0
+		}
+		_ = arena.Alloc(sz, 1)
 	}
+	return ma.Cap(), ma.Cap() - ma.Len()
+}
 
-	slackCursorPct := slackPct(cursorWasted, cursorConsumed)
-	slackScanPct := slackPct(scan0Wasted, scan0Consumed)
+func testLogWasteComparison(t *testing.T, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted int) (cursorSlackPct, scanSlackPct float64) {
+	t.Helper()
+	cursorSlackPct = float64(cursorWasted) / float64(cursorConsumed) * 100
+	scanSlackPct = float64(scan0Wasted) / float64(scan0Consumed) * 100
 	t.Logf("cursor: consumed=%d B  wasted=%d B  slack=%.2f%%",
-		cursorConsumed, cursorWasted, slackCursorPct)
+		cursorConsumed, cursorWasted, cursorSlackPct)
 	t.Logf("scan0 : consumed=%d B  wasted=%d B  slack=%.2f%%",
-		scan0Consumed, scan0Wasted, slackScanPct)
+		scan0Consumed, scan0Wasted, scanSlackPct)
 	t.Logf("cursor consumes %d B (%.1f%%) more memory than first-fit",
 		cursorConsumed-scan0Consumed,
 		float64(cursorConsumed-scan0Consumed)/float64(scan0Consumed)*100)
-
-	// The cursor never backfills earlier buffers.
-	require.GreaterOrEqual(t, cursorWasted, scan0Wasted,
-		"cursor scan should waste >= first-fit scan under mixed sizes")
-	require.GreaterOrEqual(t, cursorConsumed, scan0Consumed,
-		"cursor should consume >= first-fit (it abandons reusable slack)")
-
-	require.Less(t, slackCursorPct, 5.0)
-	require.Less(t, slackScanPct, 1.0)
+	return
 }
 
 func TestMonotonicArenaInitialBufferCountReset(t *testing.T) {
