@@ -3,6 +3,8 @@
 package arena
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"testing"
 	"unsafe"
 
@@ -873,6 +875,304 @@ func TestMonotonicArenaInitialBufferCountAllocation(t *testing.T) {
 	require.Equal(t, 200, arena.Len())
 	// The third buffer might have enough space, or we might need a fourth buffer
 	require.True(t, len(arena.(*monotonicArena).buffers) >= 3)
+}
+
+// TestMonotonicArenaCursorStartsAtZero verifies the cursor is zero on a fresh
+// arena, before any Alloc has succeeded.
+func TestMonotonicArenaCursorStartsAtZero(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorStaysOnSameBufferHit verifies that successive allocs
+// landing in the same buffer leave the cursor unchanged.
+func TestMonotonicArenaCursorStaysOnSameBufferHit(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(1024)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorAdvancesOnGrow verifies that growing the arena (when
+// no existing buffer can fit the request) advances the cursor to the new
+// trailing buffer.
+func TestMonotonicArenaCursorAdvancesOnGrow(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 0, arena.cursor)
+	require.Equal(t, 1, len(arena.buffers))
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 1, arena.cursor)
+	require.Equal(t, 2, len(arena.buffers))
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 2, arena.cursor)
+	require.Equal(t, 3, len(arena.buffers))
+}
+
+// TestMonotonicArenaCursorAdvancesPastFullBuffersToLaterBuffer verifies that
+// when the cursor's buffer is full but a later existing buffer has space, the
+// cursor advances to the later buffer that satisfied the alloc.
+func TestMonotonicArenaCursorAdvancesPastFullBuffersToLaterBuffer(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(3), WithMinBufferSize(64)).(*monotonicArena)
+	require.Equal(t, 3, len(arena.buffers))
+
+	arena.buffers[0].alloc(64, 1)
+	arena.buffers[1].alloc(64, 1)
+	require.Equal(t, 0, arena.cursor)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 2, arena.cursor)
+	require.Equal(t, 3, len(arena.buffers))
+}
+
+// TestMonotonicArenaCursorRewindsOnReset verifies that Reset returns the
+// cursor to zero so subsequent allocs can reuse early buffers.
+func TestMonotonicArenaCursorRewindsOnReset(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 2, arena.cursor)
+
+	arena.Reset()
+	require.Equal(t, 0, arena.cursor)
+
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorRewindsOnRelease verifies that Release returns the
+// cursor to zero so the arena starts fresh after release.
+func TestMonotonicArenaCursorRewindsOnRelease(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.NotNil(t, arena.Alloc(64, 1))
+	require.Equal(t, 1, arena.cursor)
+
+	arena.Release()
+	require.Equal(t, 0, arena.cursor)
+}
+
+// TestMonotonicArenaCursorDoesNotRescanFullBuffers verifies the regression bound:
+// after the arena has grown, the cursor pins subsequent allocs to the
+// trailing buffer instead of rescanning full buffers from index 0.
+func TestMonotonicArenaCursorDoesNotRescanFullBuffers(t *testing.T) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(64)).(*monotonicArena)
+
+	for range 10 {
+		require.NotNil(t, arena.Alloc(64, 1))
+	}
+	require.Equal(t, 10, len(arena.buffers))
+	require.Equal(t, 9, arena.cursor)
+
+	// First small alloc forces a grow (buffer[9] is full from the 10th
+	// exact-fill alloc above). The new trailing buffer becomes the cursor.
+	require.NotNil(t, arena.Alloc(8, 1))
+	require.Equal(t, 11, len(arena.buffers))
+	require.Equal(t, 10, arena.cursor)
+
+	// All subsequent small allocs land in buffer[10] without rescanning the
+	// 10 full buffers in front of it. The cursor stays put until that
+	// buffer fills.
+	for range 7 {
+		require.NotNil(t, arena.Alloc(8, 1))
+		require.Equal(t, 10, arena.cursor)
+		require.Equal(t, 11, len(arena.buffers))
+	}
+}
+
+// BenchmarkMonotonicArenaAllocAfterFullBuffers measures per-Alloc cost when the
+// arena already holds numBuffers full buffers followed by one buffer with free
+// space — the Cosmo Router hot path from issue #2. A scan from index 0 pays
+// O(numBuffers) per call, so ns/op rises with numBuffers; the cursor
+// optimization starts the scan at the last-used buffer, making it O(1) (flat).
+//
+// The trailing buffer is large and its offset is reset on overflow rather than
+// letting Alloc append new buffers, so the buffer count stays fixed at
+// numBuffers+1 and only the prefix-scan length varies across sub-benchmarks.
+func BenchmarkMonotonicArenaAllocAfterFullBuffers(b *testing.B) {
+	const bufSize = 1024
+	const allocSize = 8
+	const trailingSize = 8 * 1024 * 1024
+	for _, numBuffers := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("buffers=%d", numBuffers), func(b *testing.B) {
+			arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize)).(*monotonicArena)
+			for range numBuffers {
+				_ = arena.Alloc(bufSize, 1)
+			}
+			arena.buffers = append(arena.buffers, newMonotonicBuffer(trailingSize))
+			_ = arena.Alloc(allocSize, 1)
+			trailing := arena.buffers[len(arena.buffers)-1]
+			b.ResetTimer()
+			for b.Loop() {
+				if trailing.offset+allocSize > trailing.size {
+					b.StopTimer()
+					trailing.offset = 0
+					b.StartTimer()
+				}
+				_ = arena.Alloc(allocSize, 1)
+			}
+		})
+	}
+}
+
+// BenchmarkMonotonicArenaAllocAcrossBuffers pre-fills N full buffers,
+// then times per-allocation cost while varying allocSize and buffer count.
+// It's measuring allocation cost as the number of existing (full) buffers grows.
+func BenchmarkMonotonicArenaAllocAcrossBuffers(b *testing.B) {
+	const bufSize = 1024
+	const alignment = 1
+	// allocSize values are deliberately NOT divisors of bufSize so that each
+	// buffer ends with un-fillable tail slack — that slack is the "waste" we
+	// want to measure. (Sizes that divide bufSize evenly produce ~zero waste.)
+	for _, allocSize := range []uintptr{9, 63} {
+		for _, numBuffers := range []int{10, 100, 1000} {
+			b.Run(fmt.Sprintf("allocSize=%d/buffers=%d/", allocSize, numBuffers), func(b *testing.B) {
+				arena := NewMonotonicArena(WithInitialBufferCount(0), WithMinBufferSize(bufSize))
+				// Warm up: fully fill numBuffers buffers so the timed loop pays
+				// the full linear scan over all of them before spilling into a
+				// freshly created buffer — the worst-case Cosmo-like path.
+				for range numBuffers {
+					_ = arena.Alloc(bufSize, alignment)
+				}
+
+				// Baseline AFTER warm-up: the warm-up buffers must not count
+				// toward what the timed loop consumes/wastes, so measure deltas
+				// from here.
+				ma := arena.(*monotonicArena)
+				baseCap := ma.Cap()
+				baseLen := ma.Len()
+
+				b.SetBytes(int64(allocSize))
+				b.ResetTimer()
+				for b.Loop() {
+					_ = arena.Alloc(allocSize, alignment)
+				}
+				b.StopTimer()
+
+				consumed := ma.Cap() - baseCap // backing memory created by the loop
+				used := ma.Len() - baseLen     // bytes handed out (incl. padding)
+				slack := consumed - used       // reserved-but-unused buffer space
+
+				// Ratios are N-independent, so they're the comparable numbers.
+				b.ReportMetric(float64(slack)/float64(consumed)*100, "slack%")
+				b.ReportMetric(float64(consumed)/float64(b.N), "consumed-B/op")
+				b.ReportMetric(float64(slack)/float64(b.N), "wasted-B/op")
+
+				arena.Release()
+			})
+		}
+	}
+}
+
+// TestMonotonicArenaCursorMixedSizeWaste documents and regression-guards the
+// memory cost of the cursor scan strategy versus a from-zero first-fit scan
+// under a mixed-size workload.
+//
+// This is a measurement, not a micro-benchmark: the footprint is a property of
+// the whole arena lifecycle and is fully deterministic, so a single replay per
+// strategy yields exact numbers. We assert the qualitative invariant (the
+// cursor trades memory for scan speed, so it must waste at least as much) and
+// log the exact figures.
+func TestMonotonicArenaCursorMixedSizeWaste(t *testing.T) {
+	const (
+		bufSize  = 4096
+		numAlloc = 100000
+	)
+
+	// Fixed-seed, mixed workload: sizes in [8, 512). Deterministic.
+	rng := rand.New(rand.NewPCG(42, 1024))
+	sizes := make([]uintptr, numAlloc)
+	for i := range sizes {
+		sizes[i] = uintptr(8 + rng.IntN(504))
+	}
+
+	cursorConsumed, cursorWasted := replayWaste(sizes, bufSize, false)
+	scan0Consumed, scan0Wasted := replayWaste(sizes, bufSize, true)
+
+	cursorSlackPct, scanSlackPct := testLogWasteComparison(t, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted)
+
+	// The cursor never backfills earlier buffers.
+	require.Greater(t, cursorWasted, scan0Wasted,
+		"cursor scan should waste > first-fit scan under mixed sizes")
+	require.Greater(t, cursorConsumed, scan0Consumed,
+		"cursor should consume > first-fit")
+
+	// observed ~4.16% vs ~0.06% slack
+	require.Less(t, cursorSlackPct, 5.0)
+	require.Less(t, scanSlackPct, 1.0)
+}
+
+// TestMonotonicArenaCursorBimodalWaste tests the cursor's worst case: a
+// bimodal workload of mostly tiny allocations with occasional multi-KB ones.
+func TestMonotonicArenaCursorBimodalWaste(t *testing.T) {
+	const (
+		bufSize  = 4096
+		numAlloc = 100000
+	)
+
+	// 6.25% of allocations are large (1–2 buffers wide); the rest are tiny.
+	// Each time a large allocation moves the cursor, we strand the tiny allocations.
+	rng := rand.New(rand.NewPCG(11, 77))
+	sizes := make([]uintptr, numAlloc)
+	for i := range sizes {
+		if i%16 == 0 {
+			sizes[i] = uintptr(bufSize + rng.IntN(2*bufSize))
+		} else {
+			sizes[i] = uintptr(8 + rng.IntN(56))
+		}
+	}
+
+	cursorConsumed, cursorWasted := replayWaste(sizes, bufSize, false)
+	scan0Consumed, scan0Wasted := replayWaste(sizes, bufSize, true)
+
+	cursorSlackPct, scanSlackPct := testLogWasteComparison(t, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted)
+
+	require.Greater(t, cursorWasted, scan0Wasted,
+		"bimodal workload should make the cursor waste strictly more than first-fit")
+	require.Greater(t, cursorConsumed, scan0Consumed,
+		"cursor should consume > first-fit")
+	// observed ~29.2% vs <0.01% slack
+	require.Less(t, cursorSlackPct, 30.0)
+	require.Less(t, scanSlackPct, 1.0)
+}
+
+// replayWaste runs a fixed allocation-size sequence through a fresh arena and
+// returns its footprint (total backing memory, and reserved-but-unused slack).
+func replayWaste(sizes []uintptr, bufSize int, fromZero bool) (consumed, wasted int) {
+	arena := NewMonotonicArena(WithInitialBufferCount(1), WithMinBufferSize(bufSize))
+	defer arena.Release()
+	ma := arena.(*monotonicArena)
+	for _, sz := range sizes {
+		if fromZero {
+			ma.cursor = 0
+		}
+		_ = arena.Alloc(sz, 1)
+	}
+	return ma.Cap(), ma.Cap() - ma.Len()
+}
+
+func testLogWasteComparison(t *testing.T, cursorConsumed, cursorWasted, scan0Consumed, scan0Wasted int) (cursorSlackPct, scanSlackPct float64) {
+	t.Helper()
+	cursorSlackPct = float64(cursorWasted) / float64(cursorConsumed) * 100
+	scanSlackPct = float64(scan0Wasted) / float64(scan0Consumed) * 100
+	t.Logf("cursor: consumed=%d B  wasted=%d B  slack=%.2f%%",
+		cursorConsumed, cursorWasted, cursorSlackPct)
+	t.Logf("scan0 : consumed=%d B  wasted=%d B  slack=%.2f%%",
+		scan0Consumed, scan0Wasted, scanSlackPct)
+	t.Logf("cursor consumes %d B (%.1f%%) more memory than first-fit",
+		cursorConsumed-scan0Consumed,
+		float64(cursorConsumed-scan0Consumed)/float64(scan0Consumed)*100)
+	return
 }
 
 func TestMonotonicArenaInitialBufferCountReset(t *testing.T) {
