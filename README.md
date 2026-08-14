@@ -10,11 +10,14 @@ you can allocate a larger chunk of memory and use it across the entire lifecycle
 go-arena works best when you can predict how much memory you'll need.
 E.g. if you can look at request headers or the body and then estimate how much memory you'll need.
 
-In addition, you'd want to use go-arena in combination with Weak Pointers.
-This way, you can allocate an arena for a request, and when the request is done,
-you can reset the arena and create a weak pointer to it.
-If another request comes in before the next GC cycle,
-you can just reuse the arena, otherwise the GC will clean it up.
+`Pool` reuses arenas without weak pointers. Each pool keeps its own idle queue,
+while all queues share a process-wide byte budget. Acquiring an arena therefore
+never waits for a weak-to-strong conversion during GC. Arenas above the per-item
+limit are released, and the oldest idle arenas are evicted when the shared budget
+is full.
+
+A `PoolItem` is a lease. Use the pointer returned by `Acquire`, do not copy it,
+and call `Release` exactly once on the same pool when the request is complete.
 
 This patterns keeps memory usage low and predictable while avoiding the number of small allocations.
 In our case, using the arena pattern reduces CPU usage by 50% and latency by 20% while increasing memory usage by 30%.
