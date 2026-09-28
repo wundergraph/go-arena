@@ -215,6 +215,20 @@ func TestArenaBufferGrowth(t *testing.T) {
 	require.True(t, buf.Cap() >= 500)
 }
 
+func TestArenaBufferGrowthDoublesCapacity(t *testing.T) {
+	arena := NewMonotonicArena(WithMinBufferSize(4096))
+	buf := NewArenaBuffer(arena)
+
+	for range 1000 {
+		require.NoError(t, buf.WriteByte('x'))
+	}
+
+	require.Equal(t, strings.Repeat("x", 1000), buf.String())
+	require.Equal(t, 1024, buf.Cap())
+	// Outgrown copies stay in the arena: 1+2+4+...+512, plus the final 1024.
+	require.Equal(t, 2047, arena.Len())
+}
+
 func TestArenaBufferWithoutArena(t *testing.T) {
 	// Test with nil arena (should fall back to standard allocation)
 	buf := NewArenaBuffer(nil)

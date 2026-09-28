@@ -60,3 +60,13 @@ func TestSliceAppendWithArena(t *testing.T) {
 	// Compare the result with the expected slice
 	require.Equal(t, expected, result)
 }
+
+func TestSliceAppendGrowthDoesNotOverflow(t *testing.T) {
+	// Zero-sized elements allow a capacity whose double overflows int.
+	s := make([]struct{}, maxInt/2+1)
+
+	s = SliceAppend(NewMonotonicArena(), s, struct{}{})
+
+	require.Equal(t, maxInt/2+2, len(s))
+	require.Equal(t, maxInt/2+2, cap(s))
+}

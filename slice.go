@@ -6,8 +6,6 @@ import (
 	"unsafe"
 )
 
-const growThreshold = 256
-
 // AllocateSlice creates a slice of type T with a given length and capacity,
 // using the provided Arena for memory allocation.
 // If the arena is non-nil, it returns a slice with memory allocated from the arena.
@@ -37,23 +35,15 @@ func SliceAppend[T any](a Arena, s []T, data ...T) []T {
 
 func growSlice[T any](a Arena, s []T, dataLen int) []T {
 	newLen := len(s) + dataLen
-	newCap := cap(s)
-
-	if newCap > 0 {
-		for newLen > newCap {
-			if newCap < growThreshold {
-				newCap *= 2
-			} else {
-				newCap += newCap / 4
-			}
-		}
-	} else {
-		newCap = dataLen
-	}
-	if newCap == cap(s) {
+	if newLen <= cap(s) {
 		return s
 	}
-	s2 := AllocateSlice[T](a, len(s), newCap)
+	// Double the capacity (or fit newLen if that is larger, including when
+	// 2*cap overflows). append grows large slices by only 1.25x because the
+	// GC frees the old array, but the arena keeps every outgrown array until
+	// Reset: 1.25x leaves about 4x the final capacity behind in dead copies,
+	// and copies as many bytes; doubling leaves about 1x.
+	s2 := AllocateSlice[T](a, len(s), max(2*cap(s), newLen))
 	copy(s2, s)
 	return s2
 }
